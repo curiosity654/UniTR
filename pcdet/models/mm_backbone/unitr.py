@@ -1,4 +1,5 @@
 import copy
+import os
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
@@ -301,6 +302,55 @@ class UniTR(nn.Module):
                                               self.image2lidar_start][i][voxel_num:] += image2lidar_neighbor_pos_embed
                 multi_pos_embed_list[0][b][i] += image2lidar_pos_embed_list[0][b -
                                                                                self.image2lidar_start][i]
+
+        if os.environ.get('UNITR_DEBUG_IMAGE2LIDAR', '0') == '1':
+            is_main = (not torch.distributed.is_available()) or \
+                (not torch.distributed.is_initialized()) or \
+                (torch.distributed.get_rank() == 0)
+            if is_main:
+                print(
+                    '[UNITR_DEBUG][image2lidar] '
+                    f'multi_feat={multi_feat.shape[0]} voxel_num={voxel_num} '
+                    f'patch_num={multi_feat.shape[0] - voxel_num} '
+                    f'coords={image2lidar_coords_bzyx.shape[0]}'
+                )
+                set_size = self.image2lidar_input_layer.set_info[0][0]
+                for shift_id in range(self.num_shifts[0]):
+                    win_inds = image2lidar_info[f'batch_win_inds_stage0_shift{shift_id}']
+                    uniq_win, win_counts = torch.unique(win_inds, return_counts=True)
+                    sparse_win = (win_counts < set_size).sum().item()
+                    print(
+                        '[UNITR_DEBUG][image2lidar] '
+                        f'shift={shift_id} windows={uniq_win.numel()} '
+                        f'vox_per_win(min/mean/max)='
+                        f'{win_counts.min().item()}/'
+                        f'{win_counts.float().mean().item():.2f}/'
+                        f'{win_counts.max().item()} '
+                        f'sparse_win(<set_size={set_size})={sparse_win}'
+                    )
+                for shift_id, shift_inds in enumerate(image2lidar_inds_list):
+                    shift_masks = image2lidar_masks_list[shift_id]
+                    for set_id, inds in enumerate(shift_inds):
+                        masks = shift_masks[set_id]
+                        flat_inds = inds.reshape(-1)
+                        unique_inds = torch.unique(flat_inds)
+                        neg_count = (flat_inds < 0).sum().item()
+                        mask_count = masks.reshape(-1).sum().item()
+                        valid_unique = torch.unique(flat_inds[flat_inds >= 0]).numel()
+                        missing = multi_feat.shape[0] - valid_unique
+                        print(
+                            '[UNITR_DEBUG][image2lidar] '
+                            f'shift={shift_id} set={set_id} '
+                            f'inds_shape={tuple(inds.shape)} '
+                            f'unique={unique_inds.numel()} '
+                            f'flat={flat_inds.numel()} '
+                            f'valid_unique={valid_unique} '
+                            f'missing={missing} '
+                            f'neg1={neg_count} '
+                            f'mask_true={mask_count} '
+                            f'min={flat_inds.min().item()} '
+                            f'max={flat_inds.max().item()}'
+                        )
         return image2lidar_inds_list, image2lidar_masks_list, multi_pos_embed_list
 
     def _lidar2image_preprocess(self, batch_dict, multi_feat, multi_pos_embed_list):
@@ -452,9 +502,12 @@ class SetAttention(nn.Module):
         self.activation = _get_activation_fn(activation)
 
     def forward(self, src, pos=None, key_padding_mask=None, voxel_inds=None, voxel_num=0):
-        set_features = src[voxel_inds]  # [win_num, 36, d_model]
+        safe_voxel_inds = voxel_inds.clamp(min=0)
+        invalid_inds_mask = voxel_inds < 0
+
+        set_features = src[safe_voxel_inds]  # [win_num, 36, d_model]
         if pos is not None:
-            set_pos = pos[voxel_inds]
+            set_pos = pos[safe_voxel_inds]
         else:
             set_pos = None
         if pos is not None:
@@ -462,19 +515,31 @@ class SetAttention(nn.Module):
             key = set_features + set_pos
             value = set_features
         if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask | invalid_inds_mask
+        else:
+            key_padding_mask = invalid_inds_mask
+        if key_padding_mask is not None:
             src2 = self.self_attn(query, key, value, key_padding_mask)[0]
         else:
             src2 = self.self_attn(query, key, value)[0]
 
         flatten_inds = voxel_inds.reshape(-1)
-        unique_flatten_inds, inverse = torch.unique(
-            flatten_inds, return_inverse=True)
-        perm = torch.arange(inverse.size(
-            0), dtype=inverse.dtype, device=inverse.device)
-        inverse, perm = inverse.flip([0]), perm.flip([0])
-        perm = inverse.new_empty(
-            unique_flatten_inds.size(0)).scatter_(0, inverse, perm)
-        src2 = src2.reshape(-1, self.d_model)[perm]
+        flatten_src2 = src2.reshape(-1, self.d_model)
+        valid_mask = flatten_inds >= 0
+
+        src2_full = src.new_zeros((src.shape[0], self.d_model))
+        if valid_mask.any():
+            valid_inds = flatten_inds[valid_mask]
+            valid_src2 = flatten_src2[valid_mask]
+            unique_flatten_inds, inverse = torch.unique(
+                valid_inds, return_inverse=True)
+            perm = torch.arange(inverse.size(
+                0), dtype=inverse.dtype, device=inverse.device)
+            inverse, perm = inverse.flip([0]), perm.flip([0])
+            perm = inverse.new_empty(
+                unique_flatten_inds.size(0)).scatter_(0, inverse, perm)
+            src2_full[valid_inds[perm]] = valid_src2[perm]
+        src2 = src2_full
 
         if self.layer_cfg.get('split_ffn', False):
             src = src + self.dropout1(src2)

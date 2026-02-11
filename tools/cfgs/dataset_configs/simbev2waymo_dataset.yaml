@@ -1,5 +1,5 @@
 DATASET: 'SimBEVDataset'
-DATA_PATH: '../data/simbev/original'
+DATA_PATH: '../data/simbev/setup/waymo_val'
 
 MAX_SWEEPS: 9
 PRED_VELOCITY: True
@@ -7,18 +7,18 @@ SET_NAN_VELOCITY_TO_ZEROS: True
 FILTER_MIN_POINTS_IN_GT: 1
 
 DATA_SPLIT: {
-    'train': train,
+    'train': val,
     'test': val
 }
 
 INFO_PATH: {
-    'train': [infos/simbev_infos_train.json],
+    'train': [infos/simbev_infos_val.json],
     'test': [infos/simbev_infos_val.json],
 }
 
 POINT_CLOUD_RANGE: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 
-BALANCED_RESAMPLING: True 
+BALANCED_RESAMPLING: False
 
 DATA_AUGMENTOR:
     DISABLE_AUG_LIST: ['placeholder']

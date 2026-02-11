@@ -1,5 +1,7 @@
 import copy
 import json
+import sys
+from contextlib import contextmanager
 import torch
 
 import numpy as np
@@ -67,8 +69,12 @@ class SimBEVDataset(DatasetTemplate):
         if self.camera_config is not None:
             self.use_camera = self.camera_config.get('USE_CAMERA', True)
             self.camera_image_config = self.camera_config.IMAGE
+            self.pad_to_max_shape = self.camera_image_config.get('PAD_TO_MAX_SHAPE', False)
+            self.pad_value = int(self.camera_image_config.get('PAD_VALUE', 0))
+            self.pad_align = self.camera_image_config.get('PAD_ALIGN', 'center')
         else:
             self.use_camera = False
+            self.pad_to_max_shape = False
         
         self.map_config = self.dataset_cfg.get('MAP_CONFIG', None)
         
@@ -102,6 +108,8 @@ class SimBEVDataset(DatasetTemplate):
 
         for key in annotations['data']:
             data_infos += annotations['data'][key]['scene_data']
+
+        data_infos = self.normalize_info_paths(data_infos)
         
         self.full_infos = data_infos
         
@@ -116,6 +124,95 @@ class SimBEVDataset(DatasetTemplate):
         self.logger.info(f'Total samples of the SimBEV dataset used: {len(data_infos)}')
 
         return data_infos
+
+    def normalize_info_paths(self, infos):
+        """
+        Normalize file paths from SimBEV annotations so they can work across
+        different local mount points.
+        """
+        path_keys = (
+            'LIDAR', 'GT_DET', 'GT_SEG', 'GT_SEG_VIZ',
+            'RGB-', 'SEG-', 'IST-', 'DPT-', 'FLW-',
+            'RAD_', 'GNSS', 'IMU'
+        )
+
+        for info in infos:
+            for key, value in info.items():
+                if not isinstance(value, str):
+                    continue
+                if not key.startswith(path_keys) and key not in path_keys:
+                    continue
+                info[key] = self.resolve_data_path(value)
+
+        return infos
+
+    def resolve_data_path(self, path_str):
+        """
+        Resolve absolute/relative paths from annotation files to the current
+        DATA_PATH layout.
+        """
+        raw_path = Path(path_str)
+
+        # Already valid as-is.
+        if raw_path.exists():
+            return str(raw_path)
+
+        # Relative path in annotation: resolve against dataset root.
+        if not raw_path.is_absolute():
+            return str(self.root_path / raw_path)
+
+        # Absolute path from another machine/mount point:
+        # use stable SimBEV subfolders under the configured root path.
+        marker_map = {
+            'ground-truth': ['ground-truth', 'ground_truth'],
+            'ground_truth': ['ground-truth', 'ground_truth'],
+            'sweeps': ['sweeps', 'samples'],
+            'samples': ['samples', 'sweeps'],
+            'infos': ['infos']
+        }
+        for marker, mapped_markers in marker_map.items():
+            if marker in raw_path.parts:
+                idx = raw_path.parts.index(marker)
+                suffix_parts = raw_path.parts[idx + 1:]
+                for mapped_marker in mapped_markers:
+                    mapped_parts = (mapped_marker,) + suffix_parts
+                    mapped_path = self.root_path / Path(*mapped_parts)
+                    if mapped_path.exists():
+                        return str(mapped_path)
+                mapped_parts = (mapped_markers[0],) + suffix_parts
+                return str(self.root_path / Path(*mapped_parts))
+
+        return str(raw_path)
+
+    @staticmethod
+    def _get_lidar_info_key(info):
+        if 'LIDAR' in info:
+            return 'LIDAR'
+        if 'LIDAR_TOP' in info:
+            return 'LIDAR_TOP'
+        raise KeyError('No lidar key found in sample info. Expected LIDAR or LIDAR_TOP.')
+
+    def _get_lidar_metadata_key(self):
+        if 'LIDAR' in self.metadata:
+            return 'LIDAR'
+        if 'LIDAR_TOP' in self.metadata:
+            return 'LIDAR_TOP'
+        raise KeyError('No lidar key found in metadata. Expected LIDAR or LIDAR_TOP.')
+
+    def _get_camera_names(self, info):
+        rgb_cameras = sorted(
+            [key[4:] for key in info.keys() if key.startswith('RGB-')]
+        )
+        camera_names = [name for name in rgb_cameras if name in self.metadata]
+        if camera_names:
+            return camera_names
+        return [name for name in CAM_NAME if ('RGB-' + name) in info and name in self.metadata]
+
+    def _get_camera_intrinsics(self, camera):
+        camera_intrinsics_by_name = self.metadata.get('camera_intrinsics_by_name', None)
+        if camera_intrinsics_by_name is not None and camera in camera_intrinsics_by_name:
+            return np.array(camera_intrinsics_by_name[camera], dtype=np.float32)
+        return np.array(self.metadata['camera_intrinsics'], dtype=np.float32)
     
     def load_gt_bboxes(self, infos):
         '''
@@ -142,7 +239,7 @@ class SimBEVDataset(DatasetTemplate):
             # Load ground truth bounding boxes from file.
             gt_det_path = info['GT_DET']
 
-            gt_det = np.load(gt_det_path, allow_pickle=True)
+            gt_det = self.safe_load_pickled_npy(gt_det_path)
 
             # Ego to global transformation.
             ego2global = np.eye(4).astype(np.float32)
@@ -152,9 +249,9 @@ class SimBEVDataset(DatasetTemplate):
 
             # Lidar to ego transformation.
             lidar2ego = np.eye(4).astype(np.float32)
-            
-            lidar2ego[:3, :3] = Q(self.metadata['LIDAR']['sensor2ego_rotation']).rotation_matrix
-            lidar2ego[:3, 3] = self.metadata['LIDAR']['sensor2ego_translation']
+            lidar_meta_key = self._get_lidar_metadata_key()
+            lidar2ego[:3, :3] = Q(self.metadata[lidar_meta_key]['sensor2ego_rotation']).rotation_matrix
+            lidar2ego[:3, 3] = self.metadata[lidar_meta_key]['sensor2ego_translation']
 
             global2lidar = np.linalg.inv(ego2global @ lidar2ego)
 
@@ -206,6 +303,41 @@ class SimBEVDataset(DatasetTemplate):
             info['valid_flag'] = np.array(valid_flag)
 
         return infos
+
+    @staticmethod
+    @contextmanager
+    def numpy_pickle_compat():
+        """
+        Temporary compatibility aliases for object arrays pickled with
+        module path `numpy._core.*`.
+        """
+        added_keys = []
+        try:
+            if 'numpy._core' not in sys.modules:
+                sys.modules['numpy._core'] = np.core
+                added_keys.append('numpy._core')
+
+            if 'numpy._core.multiarray' not in sys.modules:
+                sys.modules['numpy._core.multiarray'] = np.core.multiarray
+                added_keys.append('numpy._core.multiarray')
+
+            yield
+        finally:
+            for key in added_keys:
+                sys.modules.pop(key, None)
+
+    def safe_load_pickled_npy(self, file_path):
+        """
+        Load object-array npy files with a fallback for numpy module rename
+        compatibility.
+        """
+        try:
+            return np.load(file_path, allow_pickle=True)
+        except ModuleNotFoundError as err:
+            if 'numpy._core' not in str(err):
+                raise
+            with self.numpy_pickle_compat():
+                return np.load(file_path, allow_pickle=True)
     
     def load_sweep_paths(self, infos):
         '''
@@ -227,7 +359,8 @@ class SimBEVDataset(DatasetTemplate):
                 if info['frame'] - (i + 1) >= 0:
                     sweep_info = self.full_infos[self.dataset_cfg.LOAD_INTERVAL * index - (i + 1)]
 
-                    info['sweeps_lidar_paths'].append(sweep_info['LIDAR'])
+                    sweep_lidar_key = self._get_lidar_info_key(sweep_info)
+                    info['sweeps_lidar_paths'].append(sweep_info[sweep_lidar_key])
 
                     ego2global = np.eye(4).astype(np.float32)
             
@@ -289,13 +422,14 @@ class SimBEVDataset(DatasetTemplate):
         '''
         info = self.infos[index]
 
+        lidar_info_key = self._get_lidar_info_key(info)
         data = dict(
             scene = info['scene'],
             frame = info['frame'],
             timestamp = info['timestamp'],
             gt_seg_path = info['GT_SEG'],
             gt_det_path = info['GT_DET'],
-            lidar_path = info['LIDAR'],
+            lidar_path = info[lidar_info_key],
             sweeps_lidar_paths = info['sweeps_lidar_paths'],
             sweeps_ego2global = info['sweeps_ego2global'],
             gt_boxes = info['gt_boxes'],
@@ -316,9 +450,9 @@ class SimBEVDataset(DatasetTemplate):
 
         # Lidar to ego transformation.
         lidar2ego = np.eye(4).astype(np.float32)
-        
-        lidar2ego[:3, :3] = Q(self.metadata['LIDAR']['sensor2ego_rotation']).rotation_matrix
-        lidar2ego[:3, 3] = self.metadata['LIDAR']['sensor2ego_translation']
+        lidar_meta_key = self._get_lidar_metadata_key()
+        lidar2ego[:3, :3] = Q(self.metadata[lidar_meta_key]['sensor2ego_rotation']).rotation_matrix
+        lidar2ego[:3, 3] = self.metadata[lidar_meta_key]['sensor2ego_translation']
         
         data['lidar2ego'] = lidar2ego
 
@@ -330,13 +464,17 @@ class SimBEVDataset(DatasetTemplate):
             data['lidar2image'] = []
             data['camera2ego'] = []
 
-            for camera in CAM_NAME:
+            camera_names = self._get_camera_names(info)
+            if len(camera_names) == 0:
+                raise KeyError('No valid RGB camera entries found in sample info for current metadata.')
+            data['camera_names'] = camera_names
+            for camera in camera_names:
                 data['image_paths'].append(info['RGB-' + camera])
 
                 # Camera intrinsics.
                 camera_intrinsics = np.eye(4).astype(np.float32)
 
-                camera_intrinsics[:3, :3] = self.metadata['camera_intrinsics']
+                camera_intrinsics[:3, :3] = self._get_camera_intrinsics(camera)
                 
                 data['camera_intrinsics'].append(camera_intrinsics)
                 
@@ -366,6 +504,38 @@ class SimBEVDataset(DatasetTemplate):
                 data['camera2ego'].append(camera2ego)
         
         return data
+
+    def pad_camera_images(self, input_dict):
+        imgs = input_dict['camera_imgs']
+        if len(imgs) == 0:
+            return input_dict
+
+        sizes = [img.size for img in imgs]
+        max_w = max(size[0] for size in sizes)
+        max_h = max(size[1] for size in sizes)
+        if all(w == max_w and h == max_h for (w, h) in sizes):
+            return input_dict
+
+        if self.pad_align != 'center':
+            raise ValueError(f'Unsupported PAD_ALIGN "{self.pad_align}". Only "center" is supported.')
+
+        padded_images = []
+        for idx, img in enumerate(imgs):
+            cur_w, cur_h = img.size
+            pad_left = (max_w - cur_w) // 2
+            pad_top = (max_h - cur_h) // 2
+
+            canvas = Image.new(img.mode, (max_w, max_h), color=(self.pad_value, self.pad_value, self.pad_value))
+            canvas.paste(img, (pad_left, pad_top))
+            padded_images.append(canvas)
+
+            input_dict['camera_intrinsics'][idx][0, 2] += pad_left
+            input_dict['camera_intrinsics'][idx][1, 2] += pad_top
+            input_dict['lidar2image'][idx] = input_dict['camera_intrinsics'][idx] @ input_dict['lidar2camera'][idx]
+
+        input_dict['camera_imgs'] = padded_images
+
+        return input_dict
 
     def crop_image(self, input_dict):
         '''
@@ -639,7 +809,9 @@ class SimBEVDataset(DatasetTemplate):
                 images.append(Image.fromarray(np.array(Image.open(name))[:,:,::-1]))
             
             input_dict['camera_imgs'] = images
-            input_dict['ori_shape'] = images[0].size
+            if self.pad_to_max_shape:
+                input_dict = self.pad_camera_images(input_dict)
+            input_dict['ori_shape'] = input_dict['camera_imgs'][0].size
 
             input_dict = self.crop_image(input_dict)
         

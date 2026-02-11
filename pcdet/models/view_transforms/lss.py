@@ -218,7 +218,12 @@ class LSSTransform(nn.Module):
             x = x[0]
 
         BN, C, H, W = x.size()
-        img = x.view(int(BN/6), 6, C, H, W)
+        num_views = batch_dict['camera_imgs'].shape[1]
+        if BN % num_views != 0:
+            raise ValueError(
+                f'Invalid image_fpn shape: BN={BN} is not divisible by num_views={num_views}'
+            )
+        img = x.view(BN // num_views, num_views, C, H, W)
         x = self.get_cam_feats(img)
         if self.accelerate and self.cache is not None:
             x = self.acc_bev_pool(x)

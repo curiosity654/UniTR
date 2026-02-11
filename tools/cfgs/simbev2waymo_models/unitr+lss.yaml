@@ -1,12 +1,12 @@
 CLASS_NAMES: ['pedestrian', 'car', 'truck', 'bus', 'motorcycle', 'bicycle']
 
 DATA_CONFIG:
-    _BASE_CONFIG_: cfgs/dataset_configs/simbev_dataset.yaml
+    _BASE_CONFIG_: cfgs/dataset_configs/simbev2waymo_dataset.yaml
     
     POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
     
     INFO_PATH: {
-      'train': [infos/simbev_infos_train.json],
+      'train': [infos/simbev_infos_val.json],
       'test': [infos/simbev_infos_val.json],
     }
 
@@ -23,6 +23,9 @@ DATA_CONFIG:
           FINAL_DIM: [256, 704]
           RESIZE_LIM_TRAIN: [0.38, 0.55]
           RESIZE_LIM_TEST: [0.48, 0.48]
+          PAD_TO_MAX_SHAPE: True
+          PAD_VALUE: 0
+          PAD_ALIGN: center
     
     DATA_AUGMENTOR:
         DISABLE_AUG_LIST: ['placeholder']
@@ -120,7 +123,7 @@ MODEL:
           voxel_size: [0.3, 0.3, 8.0]
           sample_num: 1
           lidar2image_layer:
-            sparse_shape: [96, 264, 6]
+            sparse_shape: [96, 264, 5]
             d_model: [128]
             set_info: [[90, 2]]
             window_shape: [[30, 30, 1]]

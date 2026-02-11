@@ -183,7 +183,12 @@ class DepthLSSTransform(nn.Module):
         x = batch_dict['image_fpn'] 
         x = x[0]
         BN, C, H, W = x.size()
-        img = x.view(int(BN/6), 6, C, H, W)
+        num_views = batch_dict['camera_imgs'].shape[1]
+        if BN % num_views != 0:
+            raise ValueError(
+                f'Invalid image_fpn shape: BN={BN} is not divisible by num_views={num_views}'
+            )
+        img = x.view(BN // num_views, num_views, C, H, W)
 
         camera_intrinsics = batch_dict['camera_intrinsics']
         camera2lidar = batch_dict['camera2lidar']
@@ -199,7 +204,7 @@ class DepthLSSTransform(nn.Module):
 
         points = batch_dict['points']
 
-        batch_size = BN // 6
+        batch_size = BN // num_views
         depth = torch.zeros(batch_size, img.shape[1], 1, *self.image_size).to(points[0].device)
 
         for b in range(batch_size):

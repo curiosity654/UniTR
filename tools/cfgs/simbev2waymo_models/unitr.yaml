@@ -1,12 +1,12 @@
 CLASS_NAMES: ['pedestrian', 'car', 'truck', 'bus', 'motorcycle', 'bicycle']
 
 DATA_CONFIG:
-    _BASE_CONFIG_: cfgs/dataset_configs/simbev_dataset.yaml
+    _BASE_CONFIG_: cfgs/dataset_configs/simbev2waymo_dataset.yaml
     
     POINT_CLOUD_RANGE: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
     
     INFO_PATH: {
-      'train': [infos/simbev_infos_train.json],
+      'train': [infos/simbev_infos_val.json],
       'test': [infos/simbev_infos_val.json],
     }
 
@@ -23,6 +23,9 @@ DATA_CONFIG:
           FINAL_DIM: [256, 704]
           RESIZE_LIM_TRAIN: [0.38, 0.55]
           RESIZE_LIM_TEST: [0.48, 0.48]
+          PAD_TO_MAX_SHAPE: True
+          PAD_VALUE: 0
+          PAD_ALIGN: center
     
     DATA_AUGMENTOR:
         DISABLE_AUG_LIST: ['placeholder']
@@ -120,41 +123,14 @@ MODEL:
           voxel_size: [0.3, 0.3, 8.0]
           sample_num: 1
           lidar2image_layer:
-            sparse_shape: [96, 264, 6]
+            sparse_shape: [96, 264, 5]
             d_model: [128]
             set_info: [[90, 2]]
             window_shape: [[30, 30, 1]]
             hybrid_factor: [1, 1, 1]
             shifts_list: [[[0, 0, 0], [15, 15, 0]]]
             expand_max_voxels: 30
-      out_indices: [0, 1, 2, 3]
-    
-    NECK:
-      NAME: GeneralizedLSSFPN
-      IN_CHANNELS: [128, 128, 128, 128]
-      OUT_CHANNELS: 256
-      START_LEVEL: 0
-      END_LEVEL: -1
-      NUM_OUTS: 4
-      USE_BIAS: True
-      ALIGN_CORNERS: True
-    
-    VTRANSFORM:
-      NAME: LSSTransform
-      IMAGE_SIZE: [256, 704]
-      IN_CHANNEL: 256
-      OUT_CHANNEL: 80
-      FEATURE_SIZE: [32, 88]
-      XBOUND: [-54.0, 54.0, 0.3]
-      YBOUND: [-54.0, 54.0, 0.3]
-      ZBOUND: [-10.0, 10.0, 20.0]
-      DBOUND: [1.0, 60.0, 0.5]
-      DOWNSAMPLE: 1
-
-    FUSER:
-      NAME: ConvFuser
-      IN_CHANNEL: 208
-      OUT_CHANNEL: 128
+      out_indices: []
 
     VFE:
       NAME: DynPillarVFE

@@ -10,7 +10,7 @@ DATA_CONFIG:
       'test': [infos/simbev_infos_val.json],
     }
 
-    LOAD_INTERVAL: 10
+    LOAD_INTERVAL: 1
 
     LIDAR_TRIM_STEP: 1
     LIDAR_SWEEPS: 9
@@ -232,7 +232,7 @@ MODEL:
             NMS_POST_MAXSIZE: 83
 
 OPTIMIZATION:
-    BATCH_SIZE_PER_GPU: 6
+    BATCH_SIZE_PER_GPU: 4
     NUM_EPOCHS: 10
 
     OPTIMIZER: adam_onecycle
